@@ -6,8 +6,8 @@ Run inside a list's folder (it reads ./list.json):
 
     JOBSGLITCH_API_KEY=... python build_company_list.py
 
-Standard library only. If the API fails or too few companies pass the rules, it exits non-zero
-and leaves yesterday's files alone.
+Standard library only. A slow or busy API is retried for up to five minutes. If it still fails,
+or too few companies pass the rules, it exits non-zero and leaves yesterday's files alone.
 """
 from __future__ import annotations
 

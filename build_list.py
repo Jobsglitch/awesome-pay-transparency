@@ -5,9 +5,10 @@ Run inside a list's folder (it reads ./list.json):
 
     JOBSGLITCH_API_KEY=... python build_list.py
 
-Standard library only, so the GitHub Action needs no install step. If the API fails, or fewer
-than `min_rows` jobs pass the rules, it exits non-zero and leaves the existing files alone:
-a bad day must never wipe the list.
+Standard library only, so the GitHub Action needs no install step. A slow or busy API is retried
+for up to five minutes per request. A search that still fails is skipped and the list is built
+from the rest; if most searches fail, or fewer than `min_rows` jobs pass the rules, it exits
+non-zero and leaves the existing files alone: a bad day must never wipe the list.
 """
 from __future__ import annotations
 
@@ -26,6 +27,11 @@ from pathlib import Path
 API_BASE = os.environ.get("JOBSGLITCH_API_BASE", "https://jobsglitch.com/api/public/v1").rstrip("/")
 PAGE_SIZE = 100          # the API's maximum
 PAUSE_SECONDS = 0.7      # stays under the API's 100 requests/minute
+REQUEST_TIMEOUT_SECONDS = 90   # longer than the API's own limits, so its 504 arrives instead of a cut-off
+RETRY_CODES = (429, 500, 502, 503, 504)
+BACKOFF_SECONDS = (10, 20, 40, 60, 90)   # then 90 s each time
+RETRY_BUDGET_SECONDS = 300               # one request, retries included
+RUN_BUDGET_SECONDS = 15 * 60             # every search together; the workflow allows 25 minutes
 SYMBOLS = {"USD": "$", "EUR": "€", "GBP": "£", "INR": "₹", "CAD": "CA$", "AUD": "A$"}
 PERIOD_SUFFIX = {"yearly": "", "monthly": "/mo", "weekly": "/wk", "daily": "/day", "hourly": "/hr"}
 
@@ -36,39 +42,69 @@ class ListError(RuntimeError):
 
 # ── Fetch ────────────────────────────────────────────────────────────────────
 
-def api_get(path: str, params: dict, key: str, tries: int = 3) -> dict:
+def api_get(path: str, params: dict, key: str, budget: float = RETRY_BUDGET_SECONDS,
+            sleep=time.sleep, clock=time.monotonic) -> dict:
+    """GET one API path. A busy or slow API (429, 5xx, a timeout) is retried with growing pauses
+    for up to `budget` seconds in all; a 4xx other than 429 is not, since it will not fix itself."""
     url = f"{API_BASE}{path}?{urllib.parse.urlencode(params)}"
     request = urllib.request.Request(url, headers={
         "Authorization": f"Bearer {key}", "Accept": "application/json", "User-Agent": "jobsglitch-list-builder"})
-    for attempt in range(1, tries + 1):
+    deadline = clock() + budget
+    for attempt in range(1, 100):
         try:
-            with urllib.request.urlopen(request, timeout=60) as response:
+            with urllib.request.urlopen(request, timeout=REQUEST_TIMEOUT_SECONDS) as response:
                 return json.load(response)
         except urllib.error.HTTPError as exc:
-            # 4xx other than 429 will not fix itself: a bad key or a bad parameter.
-            if exc.code not in (429, 500, 502, 503, 504) or attempt == tries:
+            if exc.code not in RETRY_CODES:
                 raise ListError(f"API answered {exc.code} for {path} {params}") from exc
-        except (urllib.error.URLError, TimeoutError) as exc:
-            if attempt == tries:
-                raise ListError(f"API unreachable for {path}: {exc}") from exc
-        time.sleep(5 * attempt)
+            problem = f"API answered {exc.code} for {path} {params}"
+        except (urllib.error.URLError, TimeoutError, ConnectionError) as exc:
+            problem = f"API unreachable for {path}: {exc}"
+        wait = BACKOFF_SECONDS[min(attempt, len(BACKOFF_SECONDS)) - 1]
+        if clock() + wait >= deadline:
+            raise ListError(f"{problem} (gave up after {attempt} tries)")
+        print(f"  {problem}; trying again in {wait}s", file=sys.stderr)
+        sleep(wait)
     raise ListError(f"API gave no answer for {path}")
 
 
-def fetch_jobs(cfg: dict, key: str, get=api_get, pause: float = PAUSE_SECONDS) -> list[dict]:
-    """Every job the list's searches return, newest first within each search, one copy per id."""
+def fetch_jobs(cfg: dict, key: str, get=api_get, pause: float = PAUSE_SECONDS,
+               failed: list | None = None, clock=time.monotonic) -> list[dict]:
+    """Every job the list's searches return, newest first within each search, one copy per id.
+
+    A search that still fails after its retries is skipped (its error goes into `failed`) and the
+    list is built from the searches that worked. When more than half of them fail, or the run's time
+    is up before most were tried, the whole run fails instead: a list built from a few searches
+    would quietly shrink."""
+    failed = [] if failed is None else failed
     found: dict[str, dict] = {}
-    for query in cfg["queries"]:
+    queries = cfg["queries"]
+    deadline = clock() + cfg.get("run_budget_seconds", RUN_BUDGET_SECONDS)
+    for query in queries:
+        if len(failed) * 2 > len(queries):
+            break
         params = {**cfg.get("params", {}), **query,
                   "days": cfg.get("days", 14), "sort_by": "date", "limit": PAGE_SIZE}
         for page in range(cfg.get("pages_per_query", 3)):
-            data = get("/jobs/search", {**params, "page": page}, key)
+            left = deadline - clock()
+            if left <= 0:
+                failed.append(f"{query}: not tried, out of time")
+                break
+            try:
+                data = get("/jobs/search", {**params, "page": page}, key, budget=min(RETRY_BUDGET_SECONDS, left))
+            except ListError as exc:
+                if page == 0:
+                    failed.append(f"{query}: {exc}")
+                # A later page failing keeps the pages already read.
+                break
             for job in data.get("jobs", []):
                 found.setdefault(job["id"], job)
             if not data.get("pagination", {}).get("has_next"):
                 break
             time.sleep(pause)
         time.sleep(pause)
+    if len(failed) * 2 > len(queries):
+        raise ListError(f"{len(failed)} of {len(queries)} searches failed: {failed[:3]}")
     return list(found.values())
 
 
@@ -251,7 +287,12 @@ def render(jobs: list[dict], cfg: dict, now: datetime) -> str:
 def build(cfg: dict, key: str, now: datetime | None = None, get=api_get, pause: float = PAUSE_SECONDS):
     """Return (readme text, jobs.json text, rows, drop tally). Raises ListError instead of producing a thin list."""
     now = now or datetime.now(timezone.utc)
-    rows, dropped = select(fetch_jobs(cfg, key, get=get, pause=pause), cfg)
+    failed: list = []
+    rows, dropped = select(fetch_jobs(cfg, key, get=get, pause=pause, failed=failed), cfg)
+    if failed:
+        dropped["searches skipped after errors"] = len(failed)
+        for problem in failed:
+            print(f"  skipped search {problem}", file=sys.stderr)
     if len(rows) < cfg.get("min_rows", 10):
         raise ListError(f"only {len(rows)} jobs passed the rules (minimum {cfg.get('min_rows', 10)}); left out: {dropped}")
     fields = ("id", "company", "title", "locations", "countries", "remote_friendly", "salary",
